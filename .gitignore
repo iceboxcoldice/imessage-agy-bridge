@@ -1,0 +1,8 @@
+.env
+config.json
+imessage-agy-daemon
+*.log
+bridge_state.json
+approvals/
+__pycache__/
+*.pyc

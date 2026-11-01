@@ -1,0 +1,23 @@
+{
+  "model": "Gemini 3.8 Flash (Medium)",
+  "toolPermission": "always-proceed",
+  "enableTerminalSandbox": false,
+  "allowNonWorkspaceAccess": true,
+  "disableSlashCommands": true,
+  "permissions": {
+    "deny": [
+      "read_file(__HOME__/Library/Messages)",
+      "write_file(__HOME__/Library/Messages)",
+      "write_file(__HOME__/Code/imessage-agy-bridge)",
+      "write_file(__HOME__/.config/imessage-agy-bridge)",
+      "write_file(__HOME__/.local/bin/imessage-agy-daemon)",
+      "write_file(__HOME__/.local/share/imessage-agy-jail)",
+      "write_file(__HOME__/.local/share/imessage-agy-admin)",
+      "write_file(__HOME__/Library/LaunchAgents)"
+    ]
+  },
+  "trustedWorkspaces": [
+    "__HOME__/.config/imessage-agy-bridge/workspaces/admin",
+    "__HOME__/.local/share/imessage-agy-admin"
+  ]
+}

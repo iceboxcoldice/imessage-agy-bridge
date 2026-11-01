@@ -1,0 +1,17 @@
+{
+  "bridge-admin-gate": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 ./scripts/pre_tool_guard.py",
+            "timeout": 300
+          }
+        ]
+      }
+    ]
+  }
+}
