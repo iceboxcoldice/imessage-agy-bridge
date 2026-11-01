@@ -1,10 +1,10 @@
 # iMessage <-> Antigravity CLI (agy) Bridge
 
-A lightweight daemon running on macOS that polls `~/Library/Messages/chat.db` for incoming iMessages from whitelisted senders (or Note-to-Self threads), dispatches queries to Google Antigravity CLI (`agy`), and replies with the generated response directly in the iMessage thread.
+A lightweight native macOS Objective-C daemon that watches `~/Library/Messages/chat.db-wal` and `chat.db` via kernel `kqueue` (`EVFILT_VNODE`) events for incoming iMessages from whitelisted senders (or Note-to-Self threads), dispatches queries to Google Antigravity CLI (`agy`) with tiered sandboxing and interactive `YES / NO` iMessage approvals, and replies directly in the iMessage thread.
 
 ## Configuration (`.env`)
 
-Configuration is kept in a local `.env` file that is excluded from version control (`.gitignore`).
+Runtime configuration and isolated workspaces live in `~/.config/imessage-agy-bridge/`. Configuration is kept in `.env` (excluded from version control via `.gitignore` and hot-reloaded automatically).
 
 1. Copy `.env.example` to `.env`:
    ```bash
@@ -13,13 +13,14 @@ Configuration is kept in a local `.env` file that is excluded from version contr
 
 2. Edit `.env` with your Apple ID / phone number:
    ```env
-   ALLOWED_SENDERS="your_apple_id@example.com,+15125550100"
-   TRIGGER_PREFIXES="!agy ,!agy,!"
+   ADMIN_HANDLES="admin@example.com,+15550001111"
+   ALLOWED_SENDERS="admin@example.com,+15550001111,secondary@example.com,+15550002222"
+   TRIGGER_PREFIXES="@agy,!agy"
    REQUIRE_PREFIX=true
    DB_PATH="~/Library/Messages/chat.db"
    AGY_BINARY="~/.local/bin/agy"
    CONVERSATION_ID="imessage-agy-main"
-   POLL_INTERVAL_SECONDS=2.0
+   POLL_INTERVAL_SECONDS=0
    MAX_REPLY_LENGTH=1800
    SEND_ACK=true
    ```
@@ -35,11 +36,10 @@ Configuration is kept in a local `.env` file that is excluded from version contr
    - System Settings $\rightarrow$ Privacy & Security $\rightarrow$ Automation
    - Allow `imessage-agy-daemon` to control `Messages.app`.
 
-## Building & Running Manually
+## Building & Deploying
 
 ```bash
 ./build.sh
-~/.local/bin/imessage-agy-daemon
 ```
 
 ## Syncing Config / Hooks (No Binary Rebuild or FDA Toggle)
@@ -50,5 +50,5 @@ Configuration is kept in a local `.env` file that is excluded from version contr
 
 To view logs:
 ```bash
-tail -f ~/Code/imessage-agy-bridge/bridge.err.log
+tail -f ~/.config/imessage-agy-bridge/bridge.err.log
 ```

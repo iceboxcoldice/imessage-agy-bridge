@@ -1,9 +1,12 @@
 #import <Foundation/Foundation.h>
 #import <sqlite3.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <fcntl.h>
 #import <signal.h>
 #import <spawn.h>
+#import <sys/event.h>
 #import <sys/stat.h>
+#import <sys/time.h>
 #import <sys/wait.h>
 #import <unistd.h>
 
@@ -124,6 +127,18 @@ static BOOL isValidUUID(NSString *str) {
 @property (nonatomic, strong) NSMutableArray<NSNumber *> *consumedRowIds;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableArray<NSDate *> *> *rateTimestamps;
 @property (nonatomic, assign) NSTimeInterval lastApprovalReplyTimestamp;
+@property (nonatomic, strong) NSString *lastCheckedDbSignature;
+@property (nonatomic, assign) int kqFd;
+@property (nonatomic, assign) int watchWalFd;
+@property (nonatomic, assign) ino_t watchWalIno;
+@property (nonatomic, assign) int watchDbFd;
+@property (nonatomic, assign) ino_t watchDbIno;
+@property (nonatomic, assign) int watchDirFd;
+@property (nonatomic, assign) ino_t watchDirIno;
+@property (nonatomic, assign) int watchEnvFd;
+@property (nonatomic, assign) ino_t watchEnvIno;
+@property (nonatomic, assign) int watchBaseDirFd;
+@property (nonatomic, assign) ino_t watchBaseDirIno;
 
 @end
 
@@ -158,12 +173,27 @@ static BOOL isValidUUID(NSString *str) {
         _rateTimestamps = [NSMutableDictionary dictionary];
         _lastApprovalReplyTimestamp = 0.0;
         _lastLogCheckTimestamp = 0.0;
+        _kqFd = kqueue();
+        _watchWalFd = -1;
+        _watchDbFd = -1;
+        _watchDirFd = -1;
+        _watchEnvFd = -1;
+        _watchBaseDirFd = -1;
 
         [self reloadEnvIfNeeded:YES];
         [self prepareApprovalDirectory];
         [self maintainLogFilesIfNeeded:YES];
     }
     return self;
+}
+
+- (void)dealloc {
+    if (_watchWalFd >= 0) close(_watchWalFd);
+    if (_watchDbFd >= 0) close(_watchDbFd);
+    if (_watchDirFd >= 0) close(_watchDirFd);
+    if (_watchEnvFd >= 0) close(_watchEnvFd);
+    if (_watchBaseDirFd >= 0) close(_watchBaseDirFd);
+    if (_kqFd >= 0) close(_kqFd);
 }
 
 - (NSString *)resolvePathValue:(NSString *)val defaultRelative:(NSString *)defRel {
@@ -344,7 +374,7 @@ static BOOL isValidUUID(NSString *str) {
     self.allowedReadRoots = env[@"ALLOWED_READ_ROOTS"] ?: @"";
 
     double poll = [env[@"POLL_INTERVAL_SECONDS"] doubleValue];
-    self.pollInterval = (poll >= 0.5) ? poll : 2.0;
+    self.pollInterval = (poll > 0.0) ? MAX(poll, 0.5) : 0.0;
 
     double dupWin = [env[@"DUPLICATE_WINDOW_SECONDS"] doubleValue];
     self.duplicateWindowSeconds = (dupWin >= 5.0) ? dupWin : 90.0;
@@ -434,6 +464,117 @@ static BOOL isValidUUID(NSString *str) {
             }
         }
     }
+}
+
+- (NSString *)currentDbStateSignature {
+    struct stat stDb, stWal;
+    memset(&stDb, 0, sizeof(stDb));
+    memset(&stWal, 0, sizeof(stWal));
+    const char *dbC = [self.dbPath fileSystemRepresentation];
+    const char *walC = [[self.dbPath stringByAppendingString:@"-wal"] fileSystemRepresentation];
+    int rcDb = stat(dbC, &stDb);
+    int rcWal = stat(walC, &stWal);
+    return [NSString stringWithFormat:@"%d:%llu:%lld:%ld.%ld|%d:%llu:%lld:%ld.%ld",
+            rcDb,
+            (unsigned long long)stDb.st_ino,
+            (long long)stDb.st_size,
+            (long)stDb.st_mtimespec.tv_sec,
+            (long)stDb.st_mtimespec.tv_nsec,
+            rcWal,
+            (unsigned long long)stWal.st_ino,
+            (long long)stWal.st_size,
+            (long)stWal.st_mtimespec.tv_sec,
+            (long)stWal.st_mtimespec.tv_nsec];
+}
+
+- (void)refreshKqueueWatchForPath:(NSString *)path fdPtr:(int *)fdPtr inoPtr:(ino_t *)inoPtr {
+    if (!path || path.length == 0 || self.kqFd < 0) return;
+    struct stat st;
+    if (stat([path fileSystemRepresentation], &st) != 0) {
+        if (*fdPtr >= 0) {
+            close(*fdPtr);
+            *fdPtr = -1;
+            *inoPtr = 0;
+        }
+        return;
+    }
+    if (*fdPtr >= 0 && *inoPtr == st.st_ino) {
+        return;
+    }
+    if (*fdPtr >= 0) {
+        close(*fdPtr);
+        *fdPtr = -1;
+        *inoPtr = 0;
+    }
+    int fd = open([path fileSystemRepresentation], O_EVTONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        struct kevent ev;
+        EV_SET(&ev,
+               fd,
+               EVFILT_VNODE,
+               EV_ADD | EV_CLEAR,
+               NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE,
+               0,
+               NULL);
+        if (kevent(self.kqFd, &ev, 1, NULL, 0, NULL) == 0) {
+            *fdPtr = fd;
+            *inoPtr = st.st_ino;
+        } else {
+            close(fd);
+        }
+    }
+}
+
+- (BOOL)waitForDatabaseOrEnvChangeWithTimeout:(NSTimeInterval)timeoutSec {
+    NSString *sigBefore = [self currentDbStateSignature];
+    if (!self.lastCheckedDbSignature || ![sigBefore isEqualToString:self.lastCheckedDbSignature]) {
+        return YES;
+    }
+
+    if (self.kqFd < 0) {
+        [NSThread sleepForTimeInterval:MIN(MAX(timeoutSec, 0.25), 5.0)];
+        return ![[self currentDbStateSignature] isEqualToString:self.lastCheckedDbSignature];
+    }
+
+    NSString *walPath = [self.dbPath stringByAppendingString:@"-wal"];
+    NSString *dirPath = [self.dbPath stringByDeletingLastPathComponent];
+    [self refreshKqueueWatchForPath:walPath fdPtr:&_watchWalFd inoPtr:&_watchWalIno];
+    [self refreshKqueueWatchForPath:self.dbPath fdPtr:&_watchDbFd inoPtr:&_watchDbIno];
+    [self refreshKqueueWatchForPath:dirPath fdPtr:&_watchDirFd inoPtr:&_watchDirIno];
+    [self refreshKqueueWatchForPath:self.envPath fdPtr:&_watchEnvFd inoPtr:&_watchEnvIno];
+    [self refreshKqueueWatchForPath:self.baseDir fdPtr:&_watchBaseDirFd inoPtr:&_watchBaseDirIno];
+
+    NSString *sigAfterReg = [self currentDbStateSignature];
+    if (![sigAfterReg isEqualToString:self.lastCheckedDbSignature]) {
+        return YES;
+    }
+
+    struct timespec ts;
+    struct timespec *tsPtr = NULL;
+    if (timeoutSec > 0.0) {
+        ts.tv_sec = (time_t)timeoutSec;
+        ts.tv_nsec = (long)((timeoutSec - (double)ts.tv_sec) * 1e9);
+        tsPtr = &ts;
+    }
+
+    struct kevent events[8];
+    int nev = kevent(self.kqFd, NULL, 0, events, 8, tsPtr);
+    if (nev > 0) {
+        for (int i = 0; i < nev; i++) {
+            if (events[i].fflags & (NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE)) {
+                int evFd = (int)events[i].ident;
+                if (evFd == _watchWalFd) { close(_watchWalFd); _watchWalFd = -1; _watchWalIno = 0; }
+                else if (evFd == _watchDbFd) { close(_watchDbFd); _watchDbFd = -1; _watchDbIno = 0; }
+                else if (evFd == _watchDirFd) { close(_watchDirFd); _watchDirFd = -1; _watchDirIno = 0; }
+                else if (evFd == _watchEnvFd) { close(_watchEnvFd); _watchEnvFd = -1; _watchEnvIno = 0; }
+                else if (evFd == _watchBaseDirFd) { close(_watchBaseDirFd); _watchBaseDirFd = -1; _watchBaseDirIno = 0; }
+            }
+        }
+        // Coalesce rapid SQLite WAL writes (message + chat_message_join) before opening SQLite
+        [NSThread sleepForTimeInterval:0.06];
+    }
+
+    return ![[self currentDbStateSignature] isEqualToString:self.lastCheckedDbSignature];
 }
 
 - (BOOL)isWhitelisted:(NSString *)handle {
@@ -1676,6 +1817,7 @@ static BOOL isValidUUID(NSString *str) {
     NSDictionary *activeReq = nil;
     int64_t approvalCursor = self.lastRowId;
     NSTimeInterval lastDbPollTs = 0.0;
+    NSString *lastApprovalDbSig = nil;
     BOOL approvedSecretThisTurn = NO;
     int waitStatus = 0;
     BOOL childExited = NO;
@@ -1737,6 +1879,7 @@ static BOOL isValidUUID(NSString *str) {
                         catLabel, summary, replyInstr];
 
                     [self sendIMessageTo:replyHandle text:msg isGroup:NO chatGuid:@""];
+                    lastApprovalDbSig = [self currentDbStateSignature];
                     NSLog(@"[APPROVAL] Sent interactive permission request %@ (code=%@, category=%@) to Admin", rid, reqCode, reqObj[@"category"]);
                     break;
                 }
@@ -1746,34 +1889,38 @@ static BOOL isValidUUID(NSString *str) {
                 NSString *reqPath = [self.approvalDir stringByAppendingPathComponent:[NSString stringWithFormat:@"req_%@.json", reqId]];
                 if (![fm fileExistsAtPath:reqPath]) {
                     activeReq = nil;
-                } else if (nowTs - lastDbPollTs >= 1.2) {
-                    lastDbPollTs = nowTs;
-                    NSNumber *decision = [self pollAdminApprovalDecisionSinceCursor:&approvalCursor expectedCode:reqCode];
-                    if (decision != nil) {
-                        BOOL approved = decision.boolValue;
-                        NSDictionary *respObj = @{
-                            @"approved": @(approved),
-                            @"token": approvalToken,
-                            @"reason": approved ? @"Approved by administrator." : @"Denied by administrator via iMessage."
-                        };
-                        NSData *respBytes = [NSJSONSerialization dataWithJSONObject:respObj options:0 error:nil];
-                        NSString *respTmp = [self.approvalDir stringByAppendingPathComponent:[NSString stringWithFormat:@".resp_%@.tmp", reqId]];
-                        NSString *respFinal = [self.approvalDir stringByAppendingPathComponent:[NSString stringWithFormat:@"resp_%@.json", reqId]];
-                        if (respBytes && [respBytes writeToFile:respTmp atomically:NO]) {
-                            chmod([respTmp fileSystemRepresentation], S_IRUSR | S_IWUSR);
-                            rename([respTmp fileSystemRepresentation], [respFinal fileSystemRepresentation]);
-                        }
+                } else {
+                    NSString *curSig = [self currentDbStateSignature];
+                    if (![curSig isEqualToString:(lastApprovalDbSig ?: @"")] || (nowTs - lastDbPollTs >= 5.0)) {
+                        lastApprovalDbSig = curSig;
+                        lastDbPollTs = nowTs;
+                        NSNumber *decision = [self pollAdminApprovalDecisionSinceCursor:&approvalCursor expectedCode:reqCode];
+                        if (decision != nil) {
+                            BOOL approved = decision.boolValue;
+                            NSDictionary *respObj = @{
+                                @"approved": @(approved),
+                                @"token": approvalToken,
+                                @"reason": approved ? @"Approved by administrator." : @"Denied by administrator via iMessage."
+                            };
+                            NSData *respBytes = [NSJSONSerialization dataWithJSONObject:respObj options:0 error:nil];
+                            NSString *respTmp = [self.approvalDir stringByAppendingPathComponent:[NSString stringWithFormat:@".resp_%@.tmp", reqId]];
+                            NSString *respFinal = [self.approvalDir stringByAppendingPathComponent:[NSString stringWithFormat:@"resp_%@.json", reqId]];
+                            if (respBytes && [respBytes writeToFile:respTmp atomically:NO]) {
+                                chmod([respTmp fileSystemRepresentation], S_IRUSR | S_IWUSR);
+                                rename([respTmp fileSystemRepresentation], [respFinal fileSystemRepresentation]);
+                            }
 
-                        if (approved && [activeReq[@"category"] isEqualToString:@"secret_access"]) {
-                            approvedSecretThisTurn = YES;
+                            if (approved && [activeReq[@"category"] isEqualToString:@"secret_access"]) {
+                                approvedSecretThisTurn = YES;
+                            }
+                            if (self.sendAck) {
+                                [self sendIMessageTo:replyHandle
+                                                text:(approved ? @"✅ Approved — executing..." : @"🛑 Denied.")
+                                             isGroup:NO
+                                            chatGuid:@""];
+                            }
+                            activeReq = nil;
                         }
-                        if (self.sendAck) {
-                            [self sendIMessageTo:replyHandle
-                                            text:(approved ? @"✅ Approved — executing..." : @"🛑 Denied.")
-                                         isGroup:NO
-                                        chatGuid:@""];
-                        }
-                        activeReq = nil;
                     }
                 }
             }
@@ -1866,7 +2013,25 @@ static BOOL isValidUUID(NSString *str) {
                 continue;
             }
 
+            NSString *currentSig = [self currentDbStateSignature];
+            if (self.lastCheckedDbSignature && [currentSig isEqualToString:self.lastCheckedDbSignature]) {
+                [self waitForDatabaseOrEnvChangeWithTimeout:self.pollInterval];
+                continue;
+            }
+            self.lastCheckedDbSignature = currentSig;
+
             NSArray<NSDictionary *> *rows = [self fetchMessagesSinceRowId:self.lastRowId limit:200];
+            if (rows.count > 0) {
+                NSDictionary *lastRow = rows.lastObject;
+                NSString *lastText = lastRow[@"text"] ?: @"";
+                NSString *lastChatGuid = lastRow[@"chat_guid"] ?: @"";
+                if (lastText.length == 0 || lastChatGuid.length == 0) {
+                    // Wait 80ms in case imagent is mid-transaction writing attributedBody or chat_message_join
+                    [NSThread sleepForTimeInterval:0.08];
+                    self.lastCheckedDbSignature = [self currentDbStateSignature];
+                    rows = [self fetchMessagesSinceRowId:self.lastRowId limit:200];
+                }
+            }
             NSMutableArray<NSDictionary *> *pending = [NSMutableArray array];
 
             for (NSDictionary *row in rows) {
@@ -1970,9 +2135,10 @@ static BOOL isValidUUID(NSString *str) {
                 }
 
                 [self sendChunkedReply:response toRecipient:replyHandle isGroup:isGroup chatGuid:chatGuid];
+                [self maintainLogFilesIfNeeded:YES];
             }
         }
-        [NSThread sleepForTimeInterval:self.pollInterval];
+        [self waitForDatabaseOrEnvChangeWithTimeout:self.pollInterval];
     }
     NSLog(@"[INFO] Daemon exiting cleanly.");
 }
